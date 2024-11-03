@@ -5,6 +5,7 @@ $reportData = @()
 
 foreach ($server in $servers) {
     try {
+        # Check if the server is online
         if (Test-Connection -ComputerName $server -Count 1 -Quiet) {
             # Get disk space information
             $diskInfo = Get-WmiObject -Class Win32_LogicalDisk -ComputerName $server | Where-Object { $_.DriveType -eq 3 } | ForEach-Object {
@@ -27,10 +28,12 @@ foreach ($server in $servers) {
             # Get UBR from registry
             $ubrValue = Invoke-Command -ComputerName $server -ScriptBlock {
                 try {
-                    (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").UBR
+                    $ubr = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").UBR
+                    return $ubr
                 }
                 catch {
-                    "N/A"
+                    Write-Output "Error retrieving UBR"
+                    return "N/A"
                 }
             }
 
@@ -80,11 +83,24 @@ foreach ($server in $servers) {
             }
         }
         else {
-            Write-Output "Server $server is unreachable."
+            # Log offline servers in the report
+            $reportData += [PSCustomObject]@{
+                ServerName       = $server
+                DriveLetter      = "N/A"
+                TotalSpaceGB     = "N/A"
+                FreeSpaceGB      = "N/A"
+                OSVersion        = "N/A"
+                OSBuildNumber    = "N/A"
+                UBR              = "N/A"
+                PatchID          = "N/A"
+                PatchDescription = "N/A"
+                InstalledOn      = "N/A"
+                Status           = "Offline"
+            }
         }
     }
     catch {
-        Write-Output "Error gathering data from $server: $_"
+        Write-Output "Error gathering data from $server $_"
     }
 }
 
