@@ -1,0 +1,90 @@
+$servers = Get-Content -Path "C:\temp\servers.txt"  # Get the list of servers
+$report = @()  # Initialize an array to hold the report data
+
+foreach ($server in $servers) {  # Loop through each server
+    if (Test-Connection -ComputerName $server -Count 1 -Quiet) {
+        $registry = [WMIClass]"\\$server\root\default:StdRegProv"
+        $keyPath = "SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+        $valueName = "UBR"
+
+        # Get UBR value
+        $ubrResult = $registry.GetDWORDValue(2147483650, $keyPath, $valueName)
+        $ubrValue = if ($ubrResult.ReturnValue -eq 0) { $ubrResult.uValue } else { "N/A" }
+
+        # Get OS Information
+        $os = Get-WmiObject -Class Win32_OperatingSystem -ComputerName $server
+        $osVersion = $os.Caption
+        $buildVersion = $os.BuildNumber
+        $installDate = [Management.ManagementDateTimeConverter]::ToDateTime($os.InstallDate)
+
+        # Get Disk Information for C: drive only
+        $disk = Get-WmiObject -Class Win32_LogicalDisk -ComputerName $server | Where-Object { $_.DeviceID -eq "C:" }
+        $totalDiskSpace = $disk.Size
+        $freeDiskSpace = $disk.FreeSpace
+        $driveLetter = $disk.DeviceID  # Store drive letter
+
+        # Get Patch Details
+        $patches = Get-WmiObject -Class Win32_QuickFixEngineering -ComputerName $server
+
+        # Prepare report
+        foreach ($patch in $patches) {
+            $installedOnDate = if ($patch.InstalledOn) {
+                $patch.InstalledOn  # Return the InstalledOn date as is
+            } else {
+                "N/A"
+            }
+
+            $report += [PSCustomObject]@{
+                Server           = $server
+                UBR              = $ubrValue
+                OSVersion        = $osVersion
+                BuildVersion     = $buildVersion
+                DriveLetter      = $driveLetter
+                TotalDiskSpace   = [math]::round($totalDiskSpace / 1GB, 2)  # Convert bytes to GB
+                FreeDiskSpace    = [math]::round($freeDiskSpace / 1GB, 2)    # Convert bytes to GB
+                InstallDate      = $installDate
+                Description      = $patch.Description
+                HotFixID         = $patch.HotFixID
+                InstalledOn      = $installedOnDate
+            }
+        }
+
+        # If no patches are found, still add a report entry with N/A values for patch details
+        if ($patches.Count -eq 0) {
+            $report += [PSCustomObject]@{
+                Server           = $server
+                UBR              = $ubrValue
+                OSVersion        = $osVersion
+                BuildVersion     = $buildVersion
+                DriveLetter      = $driveLetter
+                TotalDiskSpace   = [math]::round($totalDiskSpace / 1GB, 2)  # Convert bytes to GB
+                FreeDiskSpace    = [math]::round($freeDiskSpace / 1GB, 2)    # Convert bytes to GB
+                InstallDate      = $installDate
+                Description      = "N/A"
+                HotFixID         = "N/A"
+                InstalledOn      = "N/A"
+            }
+        }
+
+        Write-Output "Report generated for server: $server"
+    } else {
+        # Add an entry for offline servers
+        $report += [PSCustomObject]@{
+            Server           = $server
+            UBR              = "N/A"
+            OSVersion        = "Offline"
+            BuildVersion     = "N/A"
+            DriveLetter      = "N/A"
+            TotalDiskSpace   = "N/A"
+            FreeDiskSpace    = "N/A"
+            InstallDate      = "N/A"
+            Description      = "N/A"
+            HotFixID         = "N/A"
+            InstalledOn      = "N/A"
+        }
+        Write-Output "Server: $server is Offline"
+    }
+}
+
+# Output report to CSV after looping through all servers
+$report | Export-Csv -Path "C:\temp\server-reports.csv" -NoTypeInformation
