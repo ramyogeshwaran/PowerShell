@@ -1,0 +1,67 @@
+# Define input and output file paths
+$inputFile = "C:\Temp\servers.txt"  # List of hostnames or IP addresses
+$outputFile = "C:\temp\output_report.csv"
+
+
+$results = @()
+
+
+$machines = Get-Content -Path $inputFile
+
+foreach ($machine in $machines) {
+    # Create an empty object for each machine
+    $result = [PSCustomObject]@{
+        Hostname      = $machine
+        IPAddress     = ""
+        OSVersion     = ""
+        SMBVersion    = ""
+        SMBStatus     = ""
+        SMBEncryption = ""
+        Status        = "Offline"
+    }
+
+
+    if (Test-Connection -ComputerName $machine -Count 1 -Quiet) {
+        
+        $result.Status = "Online"
+
+        # Get IP address
+        try {
+            $ipInfo = [System.Net.Dns]::GetHostAddresses($machine) | Where-Object { $_.AddressFamily -eq 'InterNetwork' }
+            $result.IPAddress = $ipInfo.IPAddressToString
+        }
+        catch {
+            $result.IPAddress = "Unable to retrieve IP"
+        }
+
+        # Get OS version
+        try {
+            $os = Get-WmiObject -Class Win32_OperatingSystem -ComputerName $machine -ErrorAction Stop
+            $result.OSVersion = $os.Caption
+        }
+        catch {
+            $result.OSVersion = "Unable to retrieve OS"
+        }
+
+        # Check SMB version, status
+        try {
+            $smb = Get-SmbServerConfiguration -CimSession $machine -ErrorAction Stop
+            $result.SMBVersion = if ($smb.EnableSMB2Protocol) { "SMBv2/SMBv3" } else { "SMBv1" }
+            $result.SMBStatus = if ($smb.EnableSMB2Protocol -or $smb.EnableSMB1Protocol) { "Enabled" } else { "Disabled" }
+            $result.SMBEncryption = if ($smb.EnableSMBEncryption) { "Enabled" } else { "Disabled" }
+        }
+        catch {
+            $result.SMBVersion = "Unable to retrieve SMB version"
+            $result.SMBStatus = "Unable to retrieve SMB status"
+            $result.SMBEncryption = "Unable to retrieve SMB encryption"
+        }
+    }
+
+    
+    $results += $result
+}
+
+# Export results to CSV
+$results | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+
+Write-Output "Report generated at $outputFile"
