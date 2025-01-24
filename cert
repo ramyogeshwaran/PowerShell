@@ -1,0 +1,1 @@
+winrm create winrm/config/Listener?Address=*+Transport=HTTPS '@{Hostname="tcd-avwap4353"; CertificateThumbprint="2E878DACDDF0C1B071329AE5E7002D53E1246CA3"}'
