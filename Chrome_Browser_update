@@ -1,100 +1,86 @@
-# Define paths
-$chromeInstaller = "C:\temp\chrome_123.exe"
-$machineListFile = "C:\temp\Computers.txt"
-$outputReport = "C:\temp\Chrome_Install_Report.csv"
+# Chrome MSI install script
+$OfflineInstallerPath = "C:\bin\chrome.msi"
+$ReportPath = "C:\bin\Chrome_MSI_Install_Debug_Report.csv"
+$ComputerListPath = "C:\bin\Computers.txt"
+$TargetVersion = [version]"138.0.7049.115"
 
-# Chrome required version
-$requiredVersion = [version]"135.0.7049.114"
+$ComputerList = Get-Content -Path $ComputerListPath
+$Report = @()
 
-$machineList = Get-Content -Path $machineListFile
+foreach ($Computer in $ComputerList) {
+    $Status = ""
+    $DetectedVersion = ""
+    $InstallLog = ""
+    try {
+        if (Test-Connection -ComputerName $Computer -Count 2 -Quiet) {
+            $ChromePath = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+            $Version = Invoke-Command -ComputerName $Computer -ScriptBlock {
+                param($Path)
+                if (Test-Path $Path) {
+                    (Get-Item $Path).VersionInfo.ProductVersion
+                } else {
+                    "NotInstalled"
+                }
+            } -ArgumentList $ChromePath -ErrorAction Stop
 
+            if ($Version -ne "NotInstalled" -and ([version]$Version -ge $TargetVersion)) {
+                $DetectedVersion = $Version
+                $Status = "Already Installed Latest Version"
+            } else {
+                Invoke-Command -ComputerName $Computer -ScriptBlock {
+                    New-Item -Path "C:\\Temp" -ItemType Directory -Force | Out-Null
+                }
+                $RemoteTempPath = "\\$Computer\C$\Temp"
+                Copy-Item -Path $OfflineInstallerPath -Destination "$RemoteTempPath\chrome.msi" -Force
 
-$report = @()
+                $InstallerRemotePath = "C:\\Temp\\chrome.msi"
+                $LogPath = "C:\\Temp\\chrome_install.log"
+                $InstallCommand = "Start-Process msiexec.exe -ArgumentList '/i `"$InstallerRemotePath`" /qn /norestart /log `"$LogPath`"' -Wait"
+                Invoke-Command -ComputerName $Computer -ScriptBlock {
+                    param($cmd) Invoke-Expression $cmd
+                } -ArgumentList $InstallCommand -ErrorAction Stop
 
+                $Version = Invoke-Command -ComputerName $Computer -ScriptBlock {
+                    param($Path)
+                    if (Test-Path $Path) {
+                        (Get-Item $Path).VersionInfo.ProductVersion
+                    } else {
+                        "Unknown"
+                    }
+                } -ArgumentList $ChromePath -ErrorAction SilentlyContinue
 
-function Get-ChromeVersionFromFileRemote {
-    param (
-        [string]$computerName
-    )
+                $DetectedVersion = $Version
 
-    $chromePaths = @(
-        "\\$computerName\C$\Program Files\Google\Chrome\Application\chrome.exe",
-        "\\$computerName\C$\Program Files (x86)\Google\Chrome\Application\chrome.exe"
-    )
-
-    foreach ($path in $chromePaths) {
-        if (Test-Path $path) {
-            $fileVersionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($path)
-            return [version]$fileVersionInfo.ProductVersion
-        }
-    }
-    return $null
-}
-
-
-function Upgrade-ChromeRemote {
-    param (
-        [string]$computerName
-    )
-
-    
-    Invoke-Command -ComputerName $computerName -ScriptBlock {
-        if (!(Test-Path "C:\Temp")) {
-            New-Item -Path "C:\" -Name "Temp" -ItemType Directory | Out-Null
-        }
-    } -ErrorAction SilentlyContinue
-
-    # Copy chrome installer
-    Copy-Item -Path $chromeInstaller -Destination "\\$computerName\C$\Temp\chrome.exe" -Force -ErrorAction Stop
-
-    # Run chrome installer silently
-    Invoke-Command -ComputerName $computerName -ScriptBlock {
-        Start-Process -FilePath "C:\Temp\chrome.exe" -ArgumentList "/silent /install" -Wait
-    } -ErrorAction Stop
-}
-
-foreach ($machine in $machineList) {
-    Write-Output "Processing $machine..."
-
-    if (Test-Connection -ComputerName $machine -Count 2 -Quiet) {
-        try {
-            $chromeVersion = Get-ChromeVersionFromFileRemote -computerName $machine
-
-            if ($chromeVersion -eq $null) {
-                Write-Output "$machine Chrome not installed."
-                $status = "Chrome not installed"
-            }
-            elseif ($chromeVersion -lt $requiredVersion) {
-                Write-Output "$machine Chrome version $chromeVersion is outdated. Upgrading..."
-
-                try {
-                    Upgrade-ChromeRemote -computerName $machine
-                    $status = "Upgraded Chrome from version $chromeVersion"
-                } catch {
-                    Write-Output "$machine Error during Chrome upgrade - $_"
-                    $status = "Failed to upgrade Chrome from version $chromeVersion"
+                if ($Version -ne "Unknown" -and ([version]$Version -ge $TargetVersion)) {
+                    $Status = "Chrome Installed or Updated"
+                    Invoke-Command -ComputerName $Computer -ScriptBlock {
+                        Remove-Item -Path "C:\\Temp\\chrome.msi" -Force -ErrorAction SilentlyContinue
+                    }
+                } else {
+                    $Status = "Installation may have failed"
+                    # Attempt to retrieve log contents
+                    $InstallLog = Invoke-Command -ComputerName $Computer -ScriptBlock {
+                        Get-Content -Path "C:\\Temp\\chrome_install.log" -ErrorAction SilentlyContinue | Out-String
+                    }
                 }
             }
-            else {
-                Write-Output "$machine Chrome version $chromeVersion is up-to-date."
-                $status = "Chrome up-to-date (Version $chromeVersion)"
-            }
-        } catch {
-            Write-Output "$machine Error during checking - $_"
-            $status = "Error during checking"
+        } else {
+            $Status = "Offline"
+            $DetectedVersion = "N/A"
         }
-    } else {
-        Write-Output "$machine Offline"
-        $status = "Machine Offline"
+    } catch {
+        $Status = "Failed: $_"
+        $DetectedVersion = "Error"
     }
 
-   
-    $report += [PSCustomObject]@{
-        MachineName = $machine
-        Status      = $status
+    $Report += [PSCustomObject]@{
+        ComputerName = $Computer
+        Status       = $Status
+        Version      = $DetectedVersion
+        Timestamp    = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        LogSnippet   = ($InstallLog -replace "\r|\n", " ").Substring(0, [Math]::Min(300, $InstallLog.Length))
     }
 }
 
-$report | Select-Object MachineName, Status | Export-Csv -Path $outputReport -NoTypeInformation -Force
-
-Write-Output "Done! Report saved to $outputReport"
+$Report | Export-Csv -Path $ReportPath -NoTypeInformation -Encoding UTF8
+Write-Host "Chrome MSI installation with debug completed. Report saved to $ReportPath"
