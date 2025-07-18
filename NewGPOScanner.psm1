@@ -1,191 +1,213 @@
 # GPOScanner.psm1
-# Version: 1.9.0
-# Author: Raghav
+# Version: 1.8.6
+# Author: Yogesh
 
 function Show-GPOScannerBanner {
     Write-Host "`n=============================" -ForegroundColor DarkCyan
-    Write-Host "   GPO Scanner v1.9.0" -ForegroundColor Cyan
+    Write-Host "   GPO Scanner v1.8.6" -ForegroundColor Cyan
     Write-Host "   Author: Raghav" -ForegroundColor DarkGray
     Write-Host "=============================`n" -ForegroundColor DarkCyan
 }
 
 function Search-GPOString {
-<#
-.SYNOPSIS
-    Scans GPOs for specific search strings (regex or plain) in XML or ADMX reports.
-
-.PARAMETER SearchStrings
-    One or more strings or regex patterns to search for in GPO reports.
-
-.PARAMETER ADMX
-    Uses HTML reports to match ADMX display names.
-
-.PARAMETER Domain
-    Specifies the domain to target (required for multi-domain environments).
-
-.PARAMETER UseCacheOnly
-    Reuses cached reports if GPO not modified.
-
-.PARAMETER ReportOnly
-    Only generates reports, no searching.
-
-.PARAMETER Linked
-    Only scan GPOs that are linked to OUs/domains in the selected domain.
-
-.PARAMETER Unlinked
-    Only scan GPOs that are not linked anywhere.
-
-.EXAMPLE
-    Search-GPOString -SearchStrings "LDAP" -Domain "corp.local"
-
-.EXAMPLE
-    Search-GPOString -SearchStrings "Minimum password age" -ADMX -Domain "example.com" -Linked
-
-.EXAMPLE
-    Search-GPOString -SearchStrings "TLS1.0" -ReportOnly -Domain "ad.forest.com"
-#>
-
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         [string[]]$SearchStrings,
 
-        [Parameter(Mandatory)]
-        [string]$Domain,
-
         [switch]$ADMX,
         [switch]$UseCacheOnly,
         [switch]$ReportOnly,
-        [switch]$Linked,
-        [switch]$Unlinked
+        [string]$Domain = $null
     )
 
     Show-GPOScannerBanner
-    $ReportPath = "C:\Tools\GPOScan\Reports"
-    $mode = if ($ADMX) { "Html" } else { "Xml" }
-    $ReportExtension = if ($ADMX) { ".html" } else { ".xml" }
-
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $ReportPath = "C:\tools\GPOScanner\GPOReports"
     if (-not (Test-Path $ReportPath)) {
         New-Item -Path $ReportPath -ItemType Directory | Out-Null
     }
 
+    $logFilePath = Join-Path $ReportPath "GPOScanner_Failures.log"
+    if (Test-Path $logFilePath) { Remove-Item $logFilePath -Force }
+
+    $DomainToQuery = if ($Domain) { $Domain } else { ([System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()).Name }
+
     function Get-AllGPOs {
-        Get-GPO -All -Domain $Domain
+        Get-GPO -All -Domain $DomainToQuery
     }
 
-    function Get-LinkedGPOs {
-        $linked = @{}
-        Get-ADOrganizationalUnit -Filter * -Server $Domain | ForEach-Object {
+    function Search-GPOReports {
+        param (
+            [array]$GPOs,
+            [string[]]$SearchStrings,
+            [string]$Mode,
+            [string]$ReportPath,
+            [switch]$UseCacheOnly,
+            [switch]$ReportOnly
+        )
+
+        $throttleLimit = 10
+        $jobList = @()
+        $results = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+        $total = $GPOs.Count
+        $scanned = 0
+        $startTime = Get-Date
+
+        foreach ($gpo in $GPOs) {
+            $jobList += Start-ThreadJob -ScriptBlock {
+                param($gpoName, $gpoId, $gpoModTime, $SearchStrings, $Mode, $UseCacheOnly, $ReportOnly, $ReportPath)
+
+                try {
+                    $ext = if ($Mode -eq 'Html') { 'html' } else { 'xml' }
+                    $reportFile = Join-Path -Path $ReportPath -ChildPath "$gpoId.$ext"
+                    $reuseReport = $false
+
+                    if (Test-Path $reportFile) {
+                        $existingTime = (Get-Item $reportFile).LastWriteTimeUtc
+                        if ($UseCacheOnly -or ($gpoModTime.ToUniversalTime() -lt $existingTime)) {
+                            $reuseReport = $true
+                        } else {
+                            Remove-Item $reportFile -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+
+                    if (-not $reuseReport) {
+                        $report = Get-GPOReport -Guid $gpoId -ReportType $Mode -ErrorAction Stop
+                        $report | Out-File -LiteralPath $reportFile -Encoding UTF8
+                    } else {
+                        $report = Get-Content -LiteralPath $reportFile -Raw
+                    }
+
+                    if ($ReportOnly) { return }
+
+                    $matches = @()
+                    foreach ($str in $SearchStrings) {
+                        $regex = [regex]::new($str, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                        if ($regex.IsMatch($report)) {
+                            $matches += [pscustomobject]@{
+                                GPOName = $gpoName
+                                GPOGuid = $gpoId
+                                Match   = $str
+                            }
+                        }
+                    }
+                    return $matches
+                } catch {
+                    throw "$gpoName ($gpoId) failed: $_"
+                }
+            } -ArgumentList $gpo.DisplayName, $gpo.Id, $gpo.ModificationTime, $SearchStrings, $Mode, $UseCacheOnly, $ReportOnly, $ReportPath
+
+            while ($jobList.Count -ge $throttleLimit) {
+                $completed = Wait-Job -Job $jobList -Any -Timeout 5
+                if ($completed -and $completed.State -in 'Completed','Failed','Stopped') {
+                    try {
+                        $output = Receive-Job -Job $completed -ErrorAction Stop
+                        if ($output) {
+                            foreach ($item in $output) { $results.Add($item) }
+                        }
+                    } catch {
+                        Add-Content -Path $logFilePath -Value "[FAILURE] $($_.Exception.Message)"
+                    } finally {
+                        $scanned++
+                        $elapsed = (Get-Date) - $startTime
+                        $eta = if ($scanned -gt 0) {
+                            [TimeSpan]::FromSeconds(($elapsed.TotalSeconds / $scanned) * ($total - $scanned))
+                        } else { [TimeSpan]::Zero }
+
+                        Write-Progress -Activity "Scanning GPOs" `
+                                       -Status "$scanned of $total scanned | ETA: $($eta.ToString("hh\:mm\:ss"))" `
+                                       -PercentComplete (($scanned / $total) * 100)
+                        Remove-Job -Job $completed -Force -ErrorAction SilentlyContinue
+                        $jobList = $jobList | Where-Object { $_.Id -ne $completed.Id }
+                    }
+                }
+            }
+        }
+
+        $jobList | Wait-Job
+
+        foreach ($job in $jobList) {
             try {
-                $inheritance = Get-GPInheritance -Target $_.DistinguishedName -Domain $Domain
-                foreach ($gpo in $inheritance.GpoLinks) {
-                    if ($gpo.Enabled) {
-                        $linked[$gpo.DisplayName] = $true
-                    }
+                $output = Receive-Job -Job $job -ErrorAction Stop
+                if ($output) {
+                    foreach ($item in $output) { $results.Add($item) }
                 }
-            } catch {}
+            } catch {
+                Add-Content -Path $logFilePath -Value "[FAILURE] $($_.Exception.Message)"
+            } finally {
+                if ($job.State -in 'Running', 'NotStarted') {
+                    Stop-Job -Job $job -Force -ErrorAction SilentlyContinue
+                }
+                Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+                $scanned++
+                Write-Progress -Activity "Finalizing GPOs" `
+                               -Status "$scanned of $total scanned" `
+                               -PercentComplete (($scanned / $total) * 100)
+            }
         }
-        return $linked.Keys
+
+        Write-Progress -Activity "Scanning GPOs" -Completed
+        return $results
     }
 
-    Write-Host "Collecting GPO list from $Domain..." -ForegroundColor Cyan
+    # DISPLAY SUMMARY
+    $scanMode = if ($ADMX) { "ADMX (HTML report search)" } else { "XML (raw policy search)" }
+    $cacheMode = if ($UseCacheOnly) { "Enabled" } else { "Disabled" }
+    $reportMode = if ($ReportOnly) { "Yes" } else { "No" }
+
+    Write-Host "Domain Target : $DomainToQuery" -ForegroundColor DarkGray
+    Write-Host "Scan Mode     : $scanMode" -ForegroundColor Gray
+    Write-Host "Cache Mode    : $cacheMode" -ForegroundColor Gray
+    Write-Host "Report Only   : $reportMode" -ForegroundColor Gray
+
+    Write-Host "`nCollecting GPOs..." -ForegroundColor Cyan
     $allGPOs = Get-AllGPOs
+    Write-Host "GPOs to scan: $($allGPOs.Count)`n" -ForegroundColor Yellow
 
-    if ($Linked) {
-        $linkedNames = Get-LinkedGPOs
-        $filteredGPOs = $allGPOs | Where-Object { $linkedNames -contains $_.DisplayName }
-    } elseif ($Unlinked) {
-        $linkedNames = Get-LinkedGPOs
-        $filteredGPOs = $allGPOs | Where-Object { $linkedNames -notcontains $_.DisplayName }
-    } else {
-        $filteredGPOs = $allGPOs
-    }
+    $mode = if ($ADMX) { 'Html' } else { 'Xml' }
 
-    $totalCount = $filteredGPOs.Count
-    Write-Host "GPOs to scan: $totalCount" -ForegroundColor Yellow
-
-    $results = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
-    $startTime = Get-Date
-    $processed = 0
-
-    $jobs = foreach ($gpo in $filteredGPOs) {
-        Start-ThreadJob -ScriptBlock {
-            param($gpo, $SearchStrings, $mode, $ReportPath, $UseCacheOnly, $ReportOnly)
-
-            $output = @()
-            $fileName = "$($gpo.Id)$($mode -eq 'Html' ? '.html' : '.xml')"
-            $reportFile = Join-Path $ReportPath $fileName
-            $reuse = $false
-
-            if (Test-Path $reportFile) {
-                $existingTime = (Get-Item $reportFile).LastWriteTimeUtc
-                if ($UseCacheOnly -or ($gpo.ModificationTime.ToUniversalTime() -lt $existingTime)) {
-                    $reuse = $true
-                } else {
-                    Remove-Item $reportFile -Force -ErrorAction SilentlyContinue
-                }
-            }
-
-            if (-not $reuse) {
-                $report = Get-GPOReport -Guid $gpo.Id -ReportType $mode -Domain $using:Domain
-                $report | Out-File -Encoding UTF8 -LiteralPath $reportFile
-            } else {
-                $report = Get-Content $reportFile -Raw
-            }
-
-            if ($ReportOnly) { return }
-
-            foreach ($str in $SearchStrings) {
-                $regex = [regex]::new($str, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-                if ($regex.IsMatch($report)) {
-                    $output += [pscustomobject]@{
-                        GPOName = $gpo.DisplayName
-                        GPOGuid = $gpo.Id
-                        Match   = $str
-                    }
-                }
-            }
-
-            return $output
-
-        } -ArgumentList $gpo, $SearchStrings, $mode, $ReportPath, $UseCacheOnly, $ReportOnly
-    }
-
-    while (@(Get-Job -State Running).Count -gt 0) {
-        Start-Sleep -Milliseconds 500
-        $done = @(Get-Job | Where-Object { $_.HasMoreData -or $_.State -eq 'Completed' }).Count
-        $pct = [math]::Round(($done / $totalCount) * 100)
-        $elapsed = (Get-Date) - $startTime
-        $eta = if ($done -gt 0) {
-            $remain = $elapsed.TotalSeconds / $done * ($totalCount - $done)
-            [TimeSpan]::FromSeconds($remain)
-        } else { [TimeSpan]::FromSeconds(0) }
-
-        $bar = '#' * ($pct / 10) + '-' * (10 - ($pct / 10))
-        Write-Host -NoNewline "`r[$bar] $pct% ($done/$totalCount) GPOs scanned... Estimated time left: $($eta.ToString("hh\:mm\:ss"))"
-    }
-
-    Write-Host ""
-
-    foreach ($j in $jobs) {
-        $output = Receive-Job $j -ErrorAction SilentlyContinue
-        foreach ($item in $output) {
-            $results.Add($item)
+    # Clean up older reports
+    Get-ChildItem -Path $ReportPath -Include *.xml, *.html -File | ForEach-Object {
+        if ($allGPOs.Id -notcontains $_.BaseName) {
+            Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
         }
-        Remove-Job $j
     }
+
+    Write-Host "Exporting GPOs..." -ForegroundColor Cyan
+    $searchResults = Search-GPOReports -GPOs $allGPOs `
+                                       -SearchStrings $SearchStrings `
+                                       -Mode $mode `
+                                       -ReportPath $ReportPath `
+                                       -UseCacheOnly:$UseCacheOnly `
+                                       -ReportOnly:$ReportOnly
+
+    Write-Host "`nScan complete." -ForegroundColor Green
 
     if ($ReportOnly) {
-        Write-Host "`nReports generated only. No search performed." -ForegroundColor Yellow
+        Write-Host "`nReport export only. No scanning performed." -ForegroundColor Yellow
+        $stopwatch.Stop()
+        Write-Host "Total execution time: $($stopwatch.Elapsed)" -ForegroundColor DarkGray
         return
     }
 
-    if ($results.Count -eq 0) {
+    if ($searchResults.Count -eq 0) {
         Write-Host "No matches found." -ForegroundColor Yellow
     } else {
-        $results | Sort-Object GPOName | Format-Table -AutoSize
-        $csvPath = Join-Path $ReportPath ("GPO_Result_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".csv")
-        $results | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
+        $searchResults = $searchResults | Sort-Object GPOName, Match -Unique
+        $searchResults | Format-Table -AutoSize
+
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $csvPath = Join-Path $ReportPath "GPO_Report_$timestamp.csv"
+        $searchResults | Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8
         Write-Host "`nResults exported to: $csvPath" -ForegroundColor Cyan
     }
+
+    if (Test-Path $logFilePath) {
+        Write-Host "`nSome GPOs failed during scanning. See log:" -ForegroundColor Red
+        Write-Host $logFilePath -ForegroundColor Yellow
+    }
+
+    $stopwatch.Stop()
+    Write-Host "`nTotal execution time: $($stopwatch.Elapsed)" -ForegroundColor DarkGray
 }
