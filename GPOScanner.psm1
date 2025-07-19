@@ -26,7 +26,7 @@
 function Show-GPOScannerBanner {
     Write-Host "`n=============================" -ForegroundColor DarkCyan
     Write-Host "   GPO Scanner v1.8.7" -ForegroundColor Cyan
-    Write-Host "   Author: Raghav" -ForegroundColor DarkGray
+    Write-Host "   Author: Yogesh" -ForegroundColor DarkGray
     Write-Host "=============================`n" -ForegroundColor DarkCyan
 }
 
