@@ -1,0 +1,21 @@
+.\Procmon64.exe /AcceptEula /Quiet /Minimized /BackingFile C:\Temp\123.pml /runtime 25
+
+.\tss.ps1 -start -scenario NET_WLAN -ADS_GPO -ETLOptions "circular:2048" -WaitEvent Evt:8003:'Microsoft-Windows-WLAN-AutoConfig/Operational' -RemoteRun -AcceptEula
+
+.\tss.ps1 -start -scenario NET_WLAN -ADS_GPO -ETLOptions "circular:2048" -WaitEvent Evt:11004:'Microsoft-Windows-WLAN-AutoConfig/Operational' -RemoteRun -AcceptEula
+
+.\tss.ps1 -start -Scenario ADS_GPO -RemoteRun -AcceptEula
+
+.\tss.ps1 -Start -Scenario ADS_GPO -AcceptEula -RemoteRun
+
+certutil -v -store root "PAG-Interception-CA-ROOT-03"
+
+certutil -store root
+
+certutil -store root
+ 
+certutil -store enterprise
+ 
+certutil -store -machine root
+ 
+certutil -store -user root
